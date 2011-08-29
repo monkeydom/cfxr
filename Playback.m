@@ -8,7 +8,7 @@
 
 #import "Playback.h"
 
-#import <SDL/SDL.h>
+// #import <SDL/SDL.h>
 #import "common.h"
 
 static Playback *playback;
@@ -23,6 +23,7 @@ static Playback *playback;
 -(void)playSample;
 -(void) synthSample:(int)length :(float*)buffer :(FILE*)file;
 -(bool)exportWAV:(NSString*)path error:(NSError**)error;
+- (void)timerTick:(NSTimer*)theTimer;
 
 @property bool playing_sample;
 @end
@@ -40,27 +41,109 @@ static Playback *playback;
 	return playback;
 }
 
-static void SDLAudioCallback(Playback* userdata, Uint8 *stream, int len);
+//static void SDLAudioCallback(Playback* userdata, Uint8 *stream, int len);
+
+-(void) dealloc;
+{
+    unsigned numbuffers = sizeof(buffers)/sizeof(*buffers);
+    
+    [timer invalidate];
+    
+    if (source!=AL_NONE)
+    {
+        alSourceStop(source);
+        
+        int queued;
+        
+        alGetSourcei(source, AL_BUFFERS_QUEUED, &queued);
+        while(queued--)
+        {
+            ALuint  buf;
+            
+            alSourceUnqueueBuffers(source, 1, &buf);
+        }
+    }
+    alDeleteSources(1, &source);
+    alDeleteBuffers(numbuffers, buffers);
+    alcMakeContextCurrent(NULL);
+    alcDestroyContext(context);
+    alcCloseDevice(device);
+    
+    [super dealloc];
+}
 
 -(id)init;
 {
 	if(![super init]) return nil;
 	
 	masterVolume = 0.05;
-	
-	SDL_AudioSpec des;
-	des.freq = 44100;
-	des.format = AUDIO_S16SYS;
-	des.channels = 1;
-	des.callback = (void (*)(void *, Uint8 *, int))SDLAudioCallback;
-	des.userdata = self;
-	des.samples = 2048;
-	if(SDL_OpenAudio(&des, NULL)) {
-		NSLog(@"Failed opening audio device");
-		[self release]; return nil;
-	}
-	SDL_PauseAudio(0);
-	
+
+    ALenum  err;
+    
+    unsigned numbuffers = sizeof(buffers)/sizeof(*buffers);
+
+    audioBufferSize = 4096;
+    
+    timer = nil;
+    
+    context = NULL;
+    
+    for (unsigned i=0; i<numbuffers; i++)
+    {
+        buffers[i]=AL_NONE;
+    }
+    
+    source = AL_NONE;
+    
+	device = alcOpenDevice(NULL);
+    if (device)
+    {
+        context = alcCreateContext(device, NULL);
+        alcMakeContextCurrent(context);
+    }
+    err = alGetError();
+    if (err!=AL_NO_ERROR)
+    {
+        NSLog(@"Failed opening audio device");
+        [self release]; return nil;
+    }
+    alGenBuffers(numbuffers, buffers);
+    err = alGetError();
+    if (err!=AL_NO_ERROR)
+    {
+        NSLog(@"Failed creating audio buffers");
+        [self release]; return nil;
+    }    
+    alGenSources(1, &source);
+    err = alGetError();
+    if (err!=AL_NO_ERROR)
+    {
+        NSLog(@"Failed creating audio source");
+        [self release]; return nil;
+    }
+    alSource3f(source, AL_POSITION, 0, 0, 0 );
+    alSource3f(source, AL_VELOCITY, 0, 0, 0 );
+    alSource3f(source, AL_DIRECTION, 0, 0, 0 );
+    alSourcef(source, AL_ROLLOFF_FACTOR, 0 );
+    alSourcei(source, AL_SOURCE_RELATIVE, AL_TRUE);
+ 
+    unsigned bufSize = sizeof(ALshort)*audioBufferSize;
+    
+    ALshort *audioBuffer = alloca(bufSize);
+    
+    memset(audioBuffer, 0, bufSize);
+    
+    for (unsigned i=0; i<numbuffers; i++)
+    {
+        alBufferData(buffers[i], AL_FORMAT_MONO16, audioBuffer, bufSize, 44100);
+    }
+    
+    alSourceQueueBuffers(source, numbuffers, buffers);
+    
+    timer = [NSTimer scheduledTimerWithTimeInterval:audioBufferSize/44100.0 target:self selector:@selector(timerTick:) userInfo:self repeats:TRUE];
+    
+    alSourcePlay(source);
+    
 	return self;
 }
 
@@ -325,11 +408,12 @@ static void SDLAudioCallback(Playback* userdata, Uint8 *stream, int len);
 }
 
 
--(void)audioCallback:(Uint8 *)stream :(int)len;
+-(void)audioCallback:(ALshort *)stream :(int)len;
 {
 	if (self.playing_sample && !mute_stream)
 	{
-		unsigned int l = len/2;
+        unsigned int crc = 0;
+		unsigned int l = len;
 		float fbuf[l];
 		memset(fbuf, 0, sizeof(fbuf));
 		SynthSample(l, fbuf, NULL);
@@ -338,16 +422,61 @@ static void SDLAudioCallback(Playback* userdata, Uint8 *stream, int len);
 			float f = fbuf[l];
 			if (f < -1.0) f = -1.0;
 			if (f > 1.0) f = 1.0;
-			((Sint16*)stream)[l] = (Sint16)(f * 32767);
+			stream[l] = (ALshort)(f * 32767);
+            crc+=stream[l];
 		}
+        //NSLog(@"Buffer CRC %u", crc);
 	}
-	else memset(stream, 0, len);		
-}
-static void SDLAudioCallback(Playback *playback, Uint8 *stream, int len)
-{
-	[playback audioCallback:stream:len];
+	else memset(stream, 0, len*sizeof(ALshort));		
 }
 
+-(void)updateBuffers;
+{
+    NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init ];
+    
+    ALshort *audioBuffer = alloca(sizeof(ALshort)*audioBufferSize);
+    
+    int queued;
+    
+    alGetSourcei(source, AL_BUFFERS_PROCESSED, &queued);
+    
+    while(queued--)
+    {
+        ALuint  buffer;
+        
+        alSourceUnqueueBuffers(source, 1, &buffer);
+        
+        [self audioCallback:audioBuffer :audioBufferSize];
+        
+        alBufferData(buffer, AL_FORMAT_MONO16, audioBuffer, audioBufferSize*sizeof(ALshort), 44100);
+        
+        alSourceQueueBuffers(source, 1, &buffer);
+        
+        ALenum code = alGetError();
+        
+        if (code!=AL_NO_ERROR)
+        {
+            NSLog(@"Failed filling audio buffer"); 
+        }
+    }
+
+    int state;
+    
+    alGetSourcei(source, AL_SOURCE_STATE, &state);
+    if (state==AL_STOPPED)
+    {
+        alSourcePlay(source);
+    }
+    [pool drain];
+    
+}
+
+-(void)timerTick:(NSTimer *)theTimer;
+{
+    Playback *playback = [theTimer userInfo];
+    
+    [playback updateBuffers];
+}
 
 -(bool)exportWAV:(NSString*)path error:(NSError**)error;
 {
@@ -413,7 +542,7 @@ static void SDLAudioCallback(Playback *playback, Uint8 *stream, int len)
 }
 
 
-@synthesize playing_sample, delegate;
+@synthesize delegate;
 -(void)setPlaying_sample:(bool)becomes;
 {
 	bool was = playing_sample;
@@ -422,4 +551,8 @@ static void SDLAudioCallback(Playback *playback, Uint8 *stream, int len)
 		[delegate playbackStoppedPlaying:self];
 }
 
+-(bool)playing_sample;
+{
+    return playing_sample;
+}
 @end

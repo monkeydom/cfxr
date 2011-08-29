@@ -8,6 +8,8 @@
 
 #import <Cocoa/Cocoa.h>
 #import "Sound.h"
+#import <OpenAL/al.h>
+#import <OpenAL/alc.h>
 
 @protocol PlaybackDelegate;
 
@@ -66,6 +68,15 @@
 	Sound *ps;
 	
 	id<NSObject, PlaybackDelegate> delegate;
+    
+    unsigned    audioBufferSize;
+    
+    ALCdevice   *device;
+    ALCcontext  *context;
+    ALuint      buffers[3];
+    ALuint      source;
+    
+    NSTimer     *timer;
 }
 +(Playback*)playback;
 
